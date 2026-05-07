@@ -7,6 +7,12 @@ import { prisma } from "./prisma";
 import path from "path";
 import fs from "fs";
 import { placeBotOrder } from "./order";
+import { createQris, generateOrderId } from "./payments";
+import {
+  buildInvoiceId,
+  formatSuccessCard,
+  rupiah,
+} from "./format/success-card";
 
 const activeSockets = new Map<string, WASocket>();
 const pairingCodes = new Map<string, string>();
@@ -124,8 +130,11 @@ export async function startWhatsAppBot(botId: string): Promise<string | null> {
       const from = msg.key.remoteJid;
       if (!from || !text) continue;
 
+      // For group messages, the actual sender is in `participant`.
+      const sender = msg.key.participant || from;
+
       try {
-        await handleWhatsAppMessage(botId, botConfig, sock, from, text);
+        await handleWhatsAppMessage(botId, sock, from, sender, text);
       } catch (err) {
         console.error(`[whatsapp] handler error:`, err);
       }
@@ -150,30 +159,310 @@ export async function startWhatsAppBot(botId: string): Promise<string | null> {
   return null;
 }
 
+/**
+ * Render the `#stock` reply: a BOT AUTO ORDER header followed by one
+ * formatted card per active product listing each variation's code, stock,
+ * price, and description. Top-3 products by sold count get the BEST SELLER
+ * marker. Output is plain text with WhatsApp `*…*` bold markers.
+ */
+async function formatStockListWA(
+  ownerUserId: string,
+  contactPerson: string | null,
+): Promise<string> {
+  const products = await prisma.product.findMany({
+    where: { userId: ownerUserId, isActive: true },
+    include: {
+      variations: {
+        where: { isActive: true },
+        include: {
+          _count: { select: { stocks: { where: { isSold: false } } } },
+        },
+        orderBy: { price: "asc" },
+      },
+    },
+    orderBy: { name: "asc" },
+  });
+
+  if (products.length === 0) {
+    return "Belum ada produk tersedia.";
+  }
+
+  // Determine BEST SELLER (top 3 by sold-stock count) per owner.
+  const soldCounts = await prisma.stock.groupBy({
+    by: ["variationId"],
+    where: {
+      isSold: true,
+      variation: { product: { userId: ownerUserId } },
+    },
+    _count: { _all: true },
+  });
+  const variationToProduct = new Map<string, string>();
+  for (const p of products) {
+    for (const v of p.variations) variationToProduct.set(v.id, p.id);
+  }
+  const productSold = new Map<string, number>();
+  for (const row of soldCounts) {
+    const pid = row.variationId
+      ? variationToProduct.get(row.variationId)
+      : undefined;
+    if (!pid) continue;
+    productSold.set(pid, (productSold.get(pid) ?? 0) + row._count._all);
+  }
+  const topProductIds = new Set(
+    [...productSold.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .filter(([, c]) => c > 0)
+      .map(([pid]) => pid),
+  );
+
+  const sections: string[] = [];
+  sections.push(
+    [
+      "*╭────〔 BOT AUTO ORDER 〕─*",
+      "*┊・* Untuk membeli Ketik Perintah Berikut",
+      "*┊・* #buynow Kode(spasi)JumlahAkun",
+      "*┊・* Ex: #buynow spo3b 1",
+      "*┊・*",
+      "*┊・* Pastikan Code & Jumlah Akun di Ketik dengan benar",
+      contactPerson
+        ? `*┊・* Contact Admin: ${contactPerson}`
+        : "*┊・* Contact Admin: -",
+      "*╰┈┈┈┈┈┈┈┈*",
+    ].join("\n"),
+  );
+
+  for (const p of products) {
+    const sold = productSold.get(p.id) ?? 0;
+    const isBest = topProductIds.has(p.id);
+    const header = isBest
+      ? `*╭────〔 ${p.name} \`BEST SELLER\`🔥 〕─*`
+      : `*╭────〔 ${p.name} 〕─*`;
+    const lines: string[] = [header, `*┊・Stok Terjual:* ${sold}`];
+    if (p.variations.length === 0) {
+      lines.push("*┊*____________________");
+      lines.push("*┊・* Belum ada variasi tersedia.");
+    } else {
+      for (const v of p.variations) {
+        lines.push("*┊*____________________");
+        lines.push(`*┊・Variasi:* ${v.name}`);
+        lines.push(`*┊・Kode:* ${v.code}`);
+        lines.push(`*┊・Stok Tersedia:* ${v._count.stocks}`);
+        lines.push(`*┊・Harga:* Rp. ${rupiah(v.price)}`);
+        lines.push(`*┊・Desc:* ${p.description ?? "-"}`);
+      }
+    }
+    lines.push("*┊*____________________");
+    sections.push(lines.join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
+function parseJidList(raw: string | null | undefined): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(/[,\n]/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+function isAuthorisedSender(
+  sender: string,
+  ownerJids: string | null,
+  adminJids: string | null,
+): "owner" | "admin" | null {
+  const s = sender.toLowerCase();
+  const owners = parseJidList(ownerJids);
+  if (owners.has(s)) return "owner";
+  const admins = parseJidList(adminJids);
+  if (admins.has(s)) return "admin";
+  return null;
+}
+
+/**
+ * Find or create a Customer keyed by `(ownerUserId, jid)`. The unique
+ * constraint protects against duplicate creates across concurrent messages.
+ */
+async function getOrCreateCustomer(
+  ownerUserId: string,
+  botId: string,
+  jid: string,
+): Promise<{
+  id: string;
+  balance: number;
+  status: string;
+  name: string | null;
+}> {
+  const existing = await prisma.customer.findUnique({
+    where: { ownerUserId_jid: { ownerUserId, jid } },
+    select: { id: true, balance: true, status: true, name: true },
+  });
+  if (existing) return existing;
+
+  try {
+    const created = await prisma.customer.create({
+      data: { ownerUserId, botId, jid, name: null },
+      select: { id: true, balance: true, status: true, name: true },
+    });
+    return created;
+  } catch {
+    const fallback = await prisma.customer.findUnique({
+      where: { ownerUserId_jid: { ownerUserId, jid } },
+      select: { id: true, balance: true, status: true, name: true },
+    });
+    if (!fallback) throw new Error("Customer create gagal");
+    return fallback;
+  }
+}
+
 async function handleWhatsAppMessage(
-  _botId: string,
-  botConfig: {
-    userId: string;
-    isAutoOrder: boolean;
-    welcomeMsg: string | null;
-    name: string;
-    contactPerson: string | null;
-  },
+  botId: string,
   sock: WASocket,
   from: string,
+  sender: string,
   text: string,
 ) {
-  const cmd = text.trim().toLowerCase();
+  const botConfig = await prisma.bot.findUnique({
+    where: { id: botId },
+    select: {
+      id: true,
+      userId: true,
+      isAutoOrder: true,
+      welcomeMsg: true,
+      name: true,
+      contactPerson: true,
+      ownerJids: true,
+      adminJids: true,
+      qrisServerId: true,
+    },
+  });
+  if (!botConfig) return;
 
-  if (cmd === "/start" || cmd === "halo" || cmd === "hi" || cmd === "hello") {
+  const isGroup = from.endsWith("@g.us");
+  const trimmed = text.trim();
+  const cmd = trimmed.toLowerCase();
+
+  // /bc broadcast — owner/admin only, sent to all participating groups.
+  if (cmd.startsWith("/bc") || cmd === "bc" || cmd.startsWith("bc ")) {
+    const role = isAuthorisedSender(
+      sender,
+      botConfig.ownerJids,
+      botConfig.adminJids,
+    );
+    if (!role) {
+      await sock.sendMessage(from, {
+        text: "Maaf, hanya owner/admin bot yang bisa /bc.",
+      });
+      return;
+    }
+    const message = trimmed.replace(/^\/?bc\s*/i, "").trim();
+    if (!message) {
+      await sock.sendMessage(from, {
+        text: "Format: /bc <pesan>\nContoh: /bc Promo akhir pekan diskon 50%",
+      });
+      return;
+    }
+    let groups: Record<string, { subject: string }> = {};
+    try {
+      groups = (await sock.groupFetchAllParticipating()) as Record<
+        string,
+        { subject: string }
+      >;
+    } catch (err) {
+      console.error("[whatsapp] groupFetchAllParticipating failed:", err);
+    }
+    const targets = Object.keys(groups);
+    if (targets.length === 0) {
+      await sock.sendMessage(from, {
+        text: "Bot belum tergabung di grup manapun.",
+      });
+      return;
+    }
+    const broadcast = await prisma.broadcast.create({
+      data: {
+        botId,
+        message,
+        targets: JSON.stringify(targets),
+        status: "pending",
+      },
+    });
+    let success = 0;
+    for (const gid of targets) {
+      try {
+        await sock.sendMessage(gid, { text: message });
+        success += 1;
+      } catch (err) {
+        console.error(`[whatsapp] /bc to ${gid} failed:`, err);
+      }
+    }
+    await prisma.broadcast.update({
+      where: { id: broadcast.id },
+      data: { status: "sent", sentAt: new Date() },
+    });
+    await sock.sendMessage(from, {
+      text: `Broadcast terkirim ke ${success}/${targets.length} grup.`,
+    });
+    return;
+  }
+
+  // #stock works everywhere — both groups and private chats.
+  if (
+    cmd === "#stock" ||
+    cmd === "/stock" ||
+    cmd === "stock"
+  ) {
+    const reply = await formatStockListWA(
+      botConfig.userId,
+      botConfig.contactPerson,
+    );
+    await sock.sendMessage(from, { text: reply });
+    return;
+  }
+
+  // Customer-facing commands below this line are private-chat only.
+  if (isGroup) {
+    // For #buynow / #buy in group, redirect the buyer to a private chat so
+    // we never expose account data to the rest of the group.
+    if (
+      cmd.startsWith("#buynow") ||
+      cmd.startsWith("#buy") ||
+      cmd.startsWith("/buy") ||
+      cmd.startsWith("/buynow") ||
+      cmd.startsWith("#topup") ||
+      cmd.startsWith("/topup")
+    ) {
+      await sock.sendMessage(from, {
+        text: "Untuk pembelian / topup, silakan kirim pesan ke private chat saya.",
+      });
+    }
+    return;
+  }
+
+  const customer = await getOrCreateCustomer(botConfig.userId, botId, sender);
+  if (customer.status !== "active") {
+    await sock.sendMessage(from, {
+      text: "Akun Anda dinonaktifkan oleh admin.",
+    });
+    return;
+  }
+
+  if (
+    cmd === "/start" ||
+    cmd === "#start" ||
+    cmd === "halo" ||
+    cmd === "hi" ||
+    cmd === "hello"
+  ) {
     const welcome =
       botConfig.welcomeMsg ||
-      `Selamat datang di ${botConfig.name}! Ketik *menu* untuk melihat produk.`;
+      `Selamat datang di ${botConfig.name}!\n\nKetik *menu* untuk lihat produk\n*/saldo* untuk cek saldo\n*/buy KODE [QTY]* untuk beli pakai saldo\n*/buynow KODE [QTY]* untuk beli langsung pakai QRIS`;
     await sock.sendMessage(from, { text: welcome });
     return;
   }
 
-  if (cmd === "menu" || cmd === "/menu") {
+  if (cmd === "menu" || cmd === "/menu" || cmd === "#menu") {
     const categories = await prisma.category.findMany({
       where: { userId: botConfig.userId, isActive: true },
       include: {
@@ -215,8 +504,20 @@ async function handleWhatsAppMessage(
       }
       reply += "\n";
     }
-    reply += "Untuk order ketik: *order [kode] [jumlah]*";
+    reply +=
+      "Order pakai saldo: */buy KODE [QTY]*\nOrder pakai QRIS: */buynow KODE [QTY]*\nCek saldo: */saldo*";
     await sock.sendMessage(from, { text: reply });
+    return;
+  }
+
+  if (cmd === "/saldo" || cmd === "saldo" || cmd === "#saldo") {
+    const fresh = await prisma.customer.findUnique({
+      where: { id: customer.id },
+      select: { balance: true },
+    });
+    await sock.sendMessage(from, {
+      text: `💰 Saldo Anda: Rp ${(fresh?.balance ?? 0).toLocaleString("id-ID")}\n\nIsi saldo: */topup NOMINAL*`,
+    });
     return;
   }
 
@@ -228,7 +529,7 @@ async function handleWhatsAppMessage(
       return;
     }
 
-    const parts = text.trim().split(/\s+/).slice(1);
+    const parts = trimmed.split(/\s+/).slice(1);
     if (parts.length < 1) {
       await sock.sendMessage(from, {
         text: "Format: *order [kode] [jumlah] [voucher]*\nContoh: order NETFLIX1 1 PROMO10",
@@ -246,6 +547,7 @@ async function handleWhatsAppMessage(
       qty,
       source: "whatsapp",
       voucherCode,
+      customerId: customer.id,
     });
 
     if (!result.ok) {
@@ -276,7 +578,272 @@ async function handleWhatsAppMessage(
     return;
   }
 
-  if (cmd === "help" || cmd === "/help") {
+  // /buy KODE [QTY] [VOUCHER] — pay from Customer balance.
+  if (
+    cmd.startsWith("/buy ") ||
+    cmd.startsWith("#buy ") ||
+    cmd.startsWith("buy ")
+  ) {
+    if (!botConfig.isAutoOrder) {
+      await sock.sendMessage(from, {
+        text: "Auto order tidak aktif. Hubungi admin.",
+      });
+      return;
+    }
+    const parts = trimmed.split(/\s+/).slice(1);
+    if (parts.length < 1) {
+      await sock.sendMessage(from, {
+        text: "Format: */buy KODE [QTY] [VOUCHER]*\nContoh: */buy NETFLIX1 1*",
+      });
+      return;
+    }
+    const code = parts[0]!;
+    const qty = parseInt(parts[1] || "1");
+    const voucherCode = parts[2] || undefined;
+
+    const result = await placeBotOrder({
+      ownerUserId: botConfig.userId,
+      code,
+      qty,
+      source: "whatsapp",
+      voucherCode,
+      customerId: customer.id,
+      paymentMode: "balance",
+    });
+    if (!result.ok) {
+      await sock.sendMessage(from, { text: `❌ ${result.error}` });
+      return;
+    }
+    const [fresh, fullCustomer] = await Promise.all([
+      prisma.customer.findUnique({
+        where: { id: customer.id },
+        select: { balance: true },
+      }),
+      prisma.customer.findUnique({
+        where: { id: customer.id },
+        select: {
+          id: true,
+          createdAt: true,
+          chatId: true,
+        },
+      }),
+    ]);
+    const buyerNumber = fullCustomer
+      ? await prisma.customer.count({
+          where: {
+            ownerUserId: botConfig.userId,
+            createdAt: { lte: fullCustomer.createdAt },
+          },
+        })
+      : 1;
+    const card = formatSuccessCard({
+      invoiceId: buildInvoiceId(result.orderId, "AKH"),
+      buyerNumber,
+      telegramId: fullCustomer?.chatId ?? null,
+      telegramUsername: null,
+      productName: result.productName,
+      variationName: result.variationName,
+      quantity: qty,
+      amount: result.subtotal,
+      fee: 0,
+      total: result.totalPrice,
+      method: "Saldo",
+      accountData: result.accountData,
+    });
+    const trailer = `\n\nSisa Saldo: Rp ${rupiah(fresh?.balance ?? 0)}`;
+    await sock.sendMessage(from, { text: card + trailer });
+    return;
+  }
+
+  // /buynow KODE [QTY] — generate a QRIS via the configured gateway.
+  if (
+    cmd.startsWith("/buynow ") ||
+    cmd.startsWith("#buynow ") ||
+    cmd.startsWith("buynow ")
+  ) {
+    if (!botConfig.isAutoOrder) {
+      await sock.sendMessage(from, {
+        text: "Auto order tidak aktif. Hubungi admin.",
+      });
+      return;
+    }
+    if (!botConfig.qrisServerId) {
+      await sock.sendMessage(from, {
+        text: "QRIS belum diatur untuk bot ini. Hubungi admin.",
+      });
+      return;
+    }
+    const parts = trimmed.split(/\s+/).slice(1);
+    if (parts.length < 1) {
+      await sock.sendMessage(from, { text: "Format: */buynow KODE [QTY]*" });
+      return;
+    }
+    const code = parts[0]!;
+    const qty = parseInt(parts[1] || "1");
+    if (!Number.isFinite(qty) || qty <= 0 || qty > 100) {
+      await sock.sendMessage(from, { text: "Jumlah tidak valid (1-100)" });
+      return;
+    }
+
+    const variation = await prisma.productVariation.findFirst({
+      where: {
+        code,
+        isActive: true,
+        product: { userId: botConfig.userId, isActive: true },
+      },
+      include: {
+        product: { select: { name: true } },
+        _count: { select: { stocks: { where: { isSold: false } } } },
+      },
+    });
+    if (!variation) {
+      await sock.sendMessage(from, { text: "Produk tidak ditemukan." });
+      return;
+    }
+    if (variation._count.stocks < qty) {
+      await sock.sendMessage(from, {
+        text: `Stock tidak cukup. Tersedia: ${variation._count.stocks}`,
+      });
+      return;
+    }
+    const amount = variation.price * qty;
+    const server = await prisma.qrisServer.findUnique({
+      where: { id: botConfig.qrisServerId },
+    });
+    if (!server || !server.isActive) {
+      await sock.sendMessage(from, { text: "QRIS tidak aktif." });
+      return;
+    }
+
+    const orderId = generateOrderId("BN");
+    const created = await createQris(server, { amount, orderId });
+    if (!created.ok) {
+      await sock.sendMessage(from, {
+        text: `❌ Gagal generate QRIS: ${created.error}`,
+      });
+      return;
+    }
+
+    await prisma.payment.create({
+      data: {
+        ownerUserId: botConfig.userId,
+        customerId: customer.id,
+        botId,
+        qrisServerId: server.id,
+        provider: server.provider,
+        orderId,
+        amount,
+        fee: created.fee,
+        totalAmount: created.totalAmount,
+        status: "pending",
+        qrString: created.qrString,
+        paymentUrl: created.paymentUrl,
+        productCode: code,
+        qty,
+        purpose: "buynow",
+        expiresAt: created.expiresAt,
+        rawResponse: JSON.stringify(created.raw ?? null),
+      },
+    });
+
+    const lines = [
+      `🧾 *QRIS Pembayaran*`,
+      ``,
+      `Produk: ${variation.product.name} - ${variation.name}`,
+      `Jumlah: ${qty}`,
+      `Total: Rp ${created.totalAmount.toLocaleString("id-ID")}`,
+      `Order ID: ${orderId}`,
+      ``,
+    ];
+    if (created.paymentUrl) lines.push(`Bayar di: ${created.paymentUrl}`);
+    if (created.qrString) lines.push(`QR String:\n${created.qrString}`);
+    if (created.expiresAt) {
+      lines.push(
+        ``,
+        `⏰ Expired: ${created.expiresAt.toLocaleString("id-ID")}`,
+      );
+    }
+    lines.push(``, `Setelah bayar, akun akan otomatis terkirim.`);
+    await sock.sendMessage(from, { text: lines.join("\n") });
+    return;
+  }
+
+  // /topup NOMINAL — generate a QRIS for crediting customer balance.
+  if (
+    cmd.startsWith("/topup") ||
+    cmd.startsWith("#topup") ||
+    cmd.startsWith("topup")
+  ) {
+    if (!botConfig.qrisServerId) {
+      await sock.sendMessage(from, {
+        text: "QRIS belum diatur untuk bot ini. Hubungi admin.",
+      });
+      return;
+    }
+    const parts = trimmed.split(/\s+/).slice(1);
+    const amount = parseInt((parts[0] || "").replace(/[^0-9]/g, ""), 10);
+    if (!Number.isFinite(amount) || amount < 1000 || amount > 10_000_000) {
+      await sock.sendMessage(from, {
+        text: "Format: */topup NOMINAL*\nMinimal Rp 1.000, maksimal Rp 10.000.000",
+      });
+      return;
+    }
+    const server = await prisma.qrisServer.findUnique({
+      where: { id: botConfig.qrisServerId },
+    });
+    if (!server || !server.isActive) {
+      await sock.sendMessage(from, { text: "QRIS tidak aktif." });
+      return;
+    }
+    const orderId = generateOrderId("TP");
+    const created = await createQris(server, { amount, orderId });
+    if (!created.ok) {
+      await sock.sendMessage(from, {
+        text: `❌ Gagal generate QRIS: ${created.error}`,
+      });
+      return;
+    }
+    await prisma.payment.create({
+      data: {
+        ownerUserId: botConfig.userId,
+        customerId: customer.id,
+        botId,
+        qrisServerId: server.id,
+        provider: server.provider,
+        orderId,
+        amount,
+        fee: created.fee,
+        totalAmount: created.totalAmount,
+        status: "pending",
+        qrString: created.qrString,
+        paymentUrl: created.paymentUrl,
+        purpose: "topup",
+        expiresAt: created.expiresAt,
+        rawResponse: JSON.stringify(created.raw ?? null),
+      },
+    });
+    const lines = [
+      `🧾 *QRIS Topup Saldo*`,
+      ``,
+      `Nominal: Rp ${amount.toLocaleString("id-ID")}`,
+      `Total: Rp ${created.totalAmount.toLocaleString("id-ID")}`,
+      `Order ID: ${orderId}`,
+      ``,
+    ];
+    if (created.paymentUrl) lines.push(`Bayar di: ${created.paymentUrl}`);
+    if (created.qrString) lines.push(`QR String:\n${created.qrString}`);
+    if (created.expiresAt) {
+      lines.push(
+        ``,
+        `⏰ Expired: ${created.expiresAt.toLocaleString("id-ID")}`,
+      );
+    }
+    lines.push(``, `Saldo akan otomatis bertambah setelah bayar.`);
+    await sock.sendMessage(from, { text: lines.join("\n") });
+    return;
+  }
+
+  if (cmd === "help" || cmd === "/help" || cmd === "#help") {
     const contact = botConfig.contactPerson
       ? `\n\n📞 Contact: ${botConfig.contactPerson}`
       : "";
@@ -284,8 +851,10 @@ async function handleWhatsAppMessage(
       text:
         "📌 *Perintah Bot:*\n\n" +
         "*menu* - Lihat produk\n" +
-        "*order [kode] [jumlah] [voucher]* - Order produk\n" +
-        "*saldo* - Info saldo\n" +
+        "*/buy KODE [QTY]* - Beli pakai saldo\n" +
+        "*/buynow KODE [QTY]* - Beli langsung pakai QRIS\n" +
+        "*/saldo* - Cek saldo\n" +
+        "*/topup NOMINAL* - Isi saldo via QRIS\n" +
         "*help* - Bantuan" +
         contact,
     });
@@ -329,6 +898,52 @@ export async function sendWhatsAppBroadcast(
     }
   }
   return results;
+}
+
+/**
+ * List groups the bot is currently a participant of. Used by the web UI's
+ * broadcast page to display target groups. Returns `[]` if the bot is not
+ * running.
+ */
+export async function listJoinedGroups(
+  botId: string,
+): Promise<{ id: string; subject: string }[]> {
+  const sock = activeSockets.get(botId);
+  if (!sock) return [];
+  try {
+    const groups = (await sock.groupFetchAllParticipating()) as Record<
+      string,
+      { subject?: string }
+    >;
+    return Object.entries(groups).map(([id, g]) => ({
+      id,
+      subject: g.subject || id,
+    }));
+  } catch (err) {
+    console.error("[whatsapp] listJoinedGroups failed:", err);
+    return [];
+  }
+}
+
+/**
+ * Push a message to a customer JID from a bot context. Used by the payment
+ * webhook handler to notify the customer once their QRIS is settled. Returns
+ * false if the bot is not currently connected.
+ */
+export async function notifyCustomerByJid(
+  botId: string,
+  jid: string,
+  text: string,
+): Promise<boolean> {
+  const sock = activeSockets.get(botId);
+  if (!sock) return false;
+  try {
+    await sock.sendMessage(jid, { text });
+    return true;
+  } catch (err) {
+    console.error("[whatsapp] notifyCustomerByJid failed:", err);
+    return false;
+  }
 }
 
 export function getPairingCode(botId: string): string | null {

@@ -8,17 +8,17 @@ datasource db {
 }
 
 model User {
-  id            String   @id @default(uuid())
-  username      String   @unique
-  email         String   @unique
-  password      String
-  role          String   @default("user") // admin | user
-  balance       Float    @default(0)
-  status        String   @default("active") // active | banned | suspended
-  phone         String?
-  avatar        String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id        String   @id @default(uuid())
+  username  String   @unique
+  email     String   @unique
+  password  String
+  role      String   @default("user") // admin | user
+  balance   Float    @default(0)
+  status    String   @default("active") // active | banned | suspended
+  phone     String?
+  avatar    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   resellers     Reseller[]
   transactions  Transaction[]
@@ -31,6 +31,8 @@ model User {
   orders        Order[]
   qrisSelection UserQrisSelection?
   backupConfigs BackupConfig[]
+  customers     Customer[]
+  payments      Payment[]
 }
 
 model Reseller {
@@ -49,34 +51,36 @@ model Reseller {
 }
 
 model QrisServer {
-  id        String   @id @default(uuid())
-  name      String
-  provider  String // eqris | pakasir | midtrans
-  apiKey    String?
-  apiSecret String?
+  id         String   @id @default(uuid())
+  name       String
+  provider   String // eqris | pakasir | midtrans
+  apiKey     String?
+  apiSecret  String?
   merchantId String?
-  isActive  Boolean  @default(true)
-  config    String?  // JSON config
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  isActive   Boolean  @default(true)
+  config     String? // JSON config
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   selections UserQrisSelection[]
+  bots       Bot[]
+  payments   Payment[]
 }
 
 model UserQrisSelection {
-  id          String     @id @default(uuid())
-  userId      String     @unique
-  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  qrisId      String
-  qrisServer  QrisServer @relation(fields: [qrisId], references: [id])
-  createdAt   DateTime   @default(now())
+  id         String     @id @default(uuid())
+  userId     String     @unique
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  qrisId     String
+  qrisServer QrisServer @relation(fields: [qrisId], references: [id])
+  createdAt  DateTime   @default(now())
 }
 
 model Transaction {
   id          String   @id @default(uuid())
   userId      String
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type        String   // debit | credit
+  type        String // debit | credit
   amount      Float
   description String
   reference   String?
@@ -88,12 +92,12 @@ model Mutation {
   id          String   @id @default(uuid())
   userId      String
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type        String   // debit | credit
+  type        String // debit | credit
   amount      Float
   balBefore   Float
   balAfter    Float
   description String
-  source      String?  // purchase | topup | withdraw | admin | voucher
+  source      String? // purchase | topup | withdraw | admin | voucher
   createdAt   DateTime @default(now())
 }
 
@@ -112,16 +116,16 @@ model Withdrawal {
 }
 
 model Category {
-  id        String    @id @default(uuid())
+  id        String   @id @default(uuid())
   userId    String
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   name      String
   slug      String
   icon      String?
-  sortOrder Int       @default(0)
-  isActive  Boolean   @default(true)
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   products Product[]
 }
@@ -168,6 +172,7 @@ model ProductVariation {
   // The bot order pipeline still filters by `product.userId` so the relation
   // is the source of truth — this column just makes (userId, code) unique.
   ownerUserId String
+
   @@unique([ownerUserId, code])
   @@index([code])
 }
@@ -176,76 +181,92 @@ model Stock {
   id          String           @id @default(uuid())
   variationId String
   variation   ProductVariation @relation(fields: [variationId], references: [id], onDelete: Cascade)
-  data        String   // email|password|info format
-  isSold      Boolean  @default(false)
+  data        String // email|password|info format
+  isSold      Boolean          @default(false)
   soldAt      DateTime?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime         @default(now())
 }
 
 model Order {
-  id           String            @id @default(uuid())
-  userId       String
-  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  resellerId   String?
-  reseller     Reseller?         @relation(fields: [resellerId], references: [id])
-  productId    String
-  product      Product           @relation(fields: [productId], references: [id])
-  variationId  String?
-  variation    ProductVariation? @relation(fields: [variationId], references: [id])
-  quantity     Int               @default(1)
-  totalPrice   Float
-  status       String            @default("pending") // pending | completed | failed | refunded
-  accountData  String?           // delivered account data
-  source       String            @default("web") // web | telegram | whatsapp
-  createdAt    DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
+  id          String            @id @default(uuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resellerId  String?
+  reseller    Reseller?         @relation(fields: [resellerId], references: [id])
+  productId   String
+  product     Product           @relation(fields: [productId], references: [id])
+  variationId String?
+  variation   ProductVariation? @relation(fields: [variationId], references: [id])
+  quantity    Int               @default(1)
+  totalPrice  Float
+  status      String            @default("pending") // pending | completed | failed | refunded
+  accountData String? // delivered account data
+  source      String            @default("web") // web | telegram | whatsapp
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
 }
 
 model Bot {
-  id            String   @id @default(uuid())
-  userId        String
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type          String   // telegram | whatsapp
-  name          String
-  token         String?  // telegram bot token
-  phoneNumber   String?  // whatsapp number
-  sessionData   String?  // whatsapp session json
-  isAutoOrder   Boolean  @default(false)
+  id             String  @id @default(uuid())
+  userId         String
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type           String // telegram | whatsapp
+  name           String
+  token          String? // telegram bot token
+  phoneNumber    String? // whatsapp number
+  sessionData    String? // whatsapp session json
+  isAutoOrder    Boolean @default(false)
   isNotification Boolean @default(false)
-  contactPerson String?
-  welcomeMsg    String?
-  isConnected   Boolean  @default(false)
-  status        String   @default("inactive") // active | inactive | error
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  contactPerson  String?
+  welcomeMsg     String?
+  // Optional banner image for Telegram /start (URL or Telegram file_id).
+  startBanner    String?
+  isConnected    Boolean @default(false)
+  status         String  @default("inactive") // active | inactive | error
+
+  // Comma-separated lists of WhatsApp JIDs (e.g. `628xxx@s.whatsapp.net`,
+  // optional `@lid`) authorised to broadcast / admin the bot.
+  ownerJids String?
+  adminJids String?
+
+  // Which QrisServer (provider+credentials) the bot uses for /buynow.
+  // The provider (eqris/pakasir/etc.) is derived from `qrisServer.provider`.
+  // null => /buynow disabled.
+  qrisServerId String?
+  qrisServer   QrisServer? @relation(fields: [qrisServerId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   broadcasts Broadcast[]
+  customers  Customer[]
+  payments   Payment[]
 }
 
 model Broadcast {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   botId     String
-  bot       Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  bot       Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
   message   String
-  targets   String   // JSON array of targets
-  status    String   @default("pending") // pending | sent | failed
+  targets   String // JSON array of targets
+  status    String    @default("pending") // pending | sent | failed
   sentAt    DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 }
 
 model Voucher {
-  id          String   @id @default(uuid())
-  code        String   @unique
+  id          String    @id @default(uuid())
+  code        String    @unique
   amount      Float
-  type        String   @default("fixed") // fixed | percentage
-  maxUses     Int      @default(1)
-  usedCount   Int      @default(0)
+  type        String    @default("fixed") // fixed | percentage
+  maxUses     Int       @default(1)
+  usedCount   Int       @default(0)
   minPurchase Float?
   expiresAt   DateTime?
-  isActive    Boolean  @default(true)
-  createdBy   String   // admin who created
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  isActive    Boolean   @default(true)
+  createdBy   String // admin who created
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   usages VoucherUsage[]
 }
@@ -261,24 +282,117 @@ model VoucherUsage {
 }
 
 model BackupConfig {
-  id          String   @id @default(uuid())
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type        String   // local | s3
-  isEnabled   Boolean  @default(false)
-  s3Bucket    String?
-  s3Region    String?
-  s3Key       String?
-  s3Secret    String?
-  localPath   String?
-  schedule    String?  // cron expression
-  lastBackup  DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       String // local | s3
+  isEnabled  Boolean   @default(false)
+  s3Bucket   String?
+  s3Region   String?
+  s3Key      String?
+  s3Secret   String?
+  localPath  String?
+  schedule   String? // cron expression
+  lastBackup DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
 }
 
 model Setting {
   id    String @id @default(uuid())
   key   String @unique
   value String
+}
+
+// End-user of a tenant's bot (a "customer"). Owned by the tenant User; a
+// single human is identified per-tenant by their WhatsApp `jid` and/or
+// Telegram `chatId`. Carries an in-platform balance the customer can use to
+// buy products via /buy without going through QRIS each time.
+model Customer {
+  id          String   @id @default(uuid())
+  ownerUserId String
+  owner       User     @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  botId       String?
+  bot         Bot?     @relation(fields: [botId], references: [id], onDelete: SetNull)
+  jid         String? // WhatsApp JID (e.g. 628xxx@s.whatsapp.net or @lid)
+  chatId      String? // Telegram chat id as string
+  name        String?
+  phone       String?
+  email       String?
+  balance     Float    @default(0)
+  status      String   @default("active") // active | banned
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  mutations CustomerMutation[]
+  payments  Payment[]
+  orders    CustomerOrder[]
+
+  @@unique([ownerUserId, jid])
+  @@unique([ownerUserId, chatId])
+  @@index([ownerUserId])
+}
+
+model CustomerMutation {
+  id          String   @id @default(uuid())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  type        String // debit | credit
+  amount      Float
+  balBefore   Float
+  balAfter    Float
+  description String
+  source      String? // purchase | topup | admin | refund
+  reference   String? // order id / payment id / external ref
+  createdAt   DateTime @default(now())
+
+  @@index([customerId])
+}
+
+// Mapping between a Customer and an Order to track which customer placed which
+// order (orders themselves remain owned by the bot tenant). Only present for
+// orders placed via /buy or /buynow on a bot.
+model CustomerOrder {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  orderId    String   @unique
+  createdAt  DateTime @default(now())
+
+  @@index([customerId])
+}
+
+// QRIS payment row tracking the lifecycle of a /buynow or /topup transaction.
+// `orderId` is the gateway-facing reference (also used as our internal idempotency
+// key); `productCode`+`qty` set => this is a /buynow that should auto-deliver
+// stock once paid; otherwise it's a /topup that just credits Customer.balance.
+model Payment {
+  id           String     @id @default(uuid())
+  ownerUserId  String
+  owner        User       @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  customerId   String?
+  customer     Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  botId        String?
+  bot          Bot?       @relation(fields: [botId], references: [id], onDelete: SetNull)
+  qrisServerId String
+  qrisServer   QrisServer @relation(fields: [qrisServerId], references: [id])
+  provider     String // eqris | pakasir
+  orderId      String     @unique
+  amount       Float
+  fee          Float      @default(0)
+  totalAmount  Float      @default(0)
+  status       String     @default("pending") // pending | completed | expired | cancelled | failed
+  qrString     String?
+  paymentUrl   String?
+  productCode  String? // /buynow target variation code
+  qty          Int? // /buynow qty
+  purpose      String     @default("buynow") // buynow | topup
+  expiresAt    DateTime?
+  paidAt       DateTime?
+  rawResponse  String? // JSON snapshot of latest gateway response
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([ownerUserId])
+  @@index([status])
 }

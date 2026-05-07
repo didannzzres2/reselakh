@@ -1,0 +1,1 @@
+ALTER TABLE "Bot" ADD COLUMN IF NOT EXISTS "startBanner" TEXT;

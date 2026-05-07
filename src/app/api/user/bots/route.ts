@@ -4,6 +4,26 @@ import { handleApiError, requireAuth, ValidationError } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { idSchema, parseJson } from "@/lib/validate";
 
+const jidListSchema = z
+  .string()
+  .max(2000)
+  .optional()
+  .nullable()
+  .refine(
+    (val) => {
+      if (!val) return true;
+      const items = val
+        .split(/[,\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      return items.every((s) => /@(s\.whatsapp\.net|lid)$/i.test(s));
+    },
+    {
+      message:
+        "Setiap JID harus diakhiri @s.whatsapp.net atau @lid (pisahkan dengan koma)",
+    },
+  );
+
 const BaseFields = {
   type: z.enum(["telegram", "whatsapp"]),
   name: z.string().trim().min(1).max(80),
@@ -13,6 +33,10 @@ const BaseFields = {
   isNotification: z.boolean().optional(),
   contactPerson: z.string().trim().max(120).optional().nullable(),
   welcomeMsg: z.string().max(2000).optional().nullable(),
+  startBanner: z.string().trim().max(1024).optional().nullable(),
+  ownerJids: jidListSchema,
+  adminJids: jidListSchema,
+  qrisServerId: z.string().trim().max(64).optional().nullable(),
 };
 
 const CreateSchema = z.object(BaseFields);
